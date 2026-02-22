@@ -1,0 +1,29 @@
+# Fly.io deployment config for CodeHive relay server
+# Deploy with: fly launch && fly deploy
+
+app = "codehive-relay"
+primary_region = "cdg"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  CODEHIVE_HOST = "0.0.0.0"
+  CODEHIVE_PORT = "4819"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 4819
+
+  [[services.ports]]
+    port = 4819
+    handlers = []
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 500
+    soft_limit = 250
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
