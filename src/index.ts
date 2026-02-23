@@ -37,4 +37,5 @@ export {
   isClientMessageType,
   isServerMessageType,
 } from "./shared/protocol.js";
+export { TelegramBot, type TelegramBotOptions } from "./telegram/bot.js";
 export type * from "./shared/types.js";

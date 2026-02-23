@@ -46,6 +46,16 @@ async function run() {
         resolve();
       });
     });
+
+    // Run Telegram bot tests (no relay needed — unit tests only)
+    console.log("\n=== TELEGRAM TESTS ===\n");
+    const tg = spawn("node", ["test-telegram.mjs"], { stdio: "inherit" });
+    await new Promise((resolve) => {
+      tg.on("close", (code) => {
+        if (code !== 0) exitCode = 1;
+        resolve();
+      });
+    });
   } finally {
     relay.kill("SIGTERM");
   }

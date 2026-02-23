@@ -48,8 +48,13 @@ src/
 │   └── index.ts     # MCP server entry point
 ├── watcher/         # File system watcher
 │   └── index.ts     # chokidar-based file change detection
+├── telegram/        # Telegram bot bridge (optional)
+│   ├── bot.ts       # TelegramBot class (long polling + relay bridge)
+│   ├── api.ts       # Telegram Bot API wrapper (native fetch)
+│   ├── formatter.ts # HTML message formatting
+│   └── types.ts     # Telegram API type definitions
 ├── cli/             # Command-line interface
-│   └── index.ts     # All CLI commands (init, relay, deploy, etc.)
+│   └── index.ts     # All CLI commands (init, relay, telegram, deploy, etc.)
 └── index.ts         # Public API exports
 ```
 
@@ -64,6 +69,7 @@ npm run build
 CODEHIVE_PORT=4821 node dist/relay/server.js &
 node test-e2e.mjs
 node test-edge-cases.mjs
+node test-telegram.mjs
 ```
 
 ## Guidelines

@@ -432,6 +432,21 @@ program
     }
 
     console.log();
+
+    // Telegram hint
+    const telegramToken = process.env["CODEHIVE_TELEGRAM_TOKEN"]
+      ?? (readJsonConfig(resolve(process.cwd(), "codehive.json"))["telegramToken"] as string | undefined);
+
+    if (telegramToken) {
+      console.log(chalk.hex("#FFB800").bold("  Telegram bot detected!"));
+      console.log(chalk.dim("  Start it with:"));
+      console.log(chalk.cyan("    codehive telegram"));
+      console.log();
+    } else {
+      console.log(chalk.dim("  Optional: Connect a Telegram bot for mobile notifications:"));
+      console.log(chalk.cyan("    codehive telegram --help"));
+      console.log();
+    }
   });
 
 // ---------------------------------------------------------------------------
@@ -743,6 +758,109 @@ program
       console.log(chalk.yellow(`  ${issues} issue(s) found. Fix them and run codehive doctor again.`));
     }
     console.log();
+  });
+
+// ---------------------------------------------------------------------------
+// codehive telegram
+// ---------------------------------------------------------------------------
+
+program
+  .command("telegram")
+  .description("Start the Telegram bot bridge (connects a Telegram chat to a CodeHive room)")
+  .option("--background", "Run in the background (detached)")
+  .action(async (options) => {
+    const projectPath = resolve(process.cwd());
+    const config = readJsonConfig(resolve(projectPath, "codehive.json"));
+
+    const token = process.env["CODEHIVE_TELEGRAM_TOKEN"]
+      ?? (config["telegramToken"] as string | undefined)
+      ?? "";
+
+    if (!token) {
+      console.error(chalk.red("  \u2717 No Telegram bot token found."));
+      console.log();
+      console.log(chalk.dim("  Set it via environment variable:"));
+      console.log(chalk.cyan("    export CODEHIVE_TELEGRAM_TOKEN=your-bot-token"));
+      console.log();
+      console.log(chalk.dim("  Or in codehive.json:"));
+      console.log(chalk.cyan('    { "telegramToken": "your-bot-token" }'));
+      console.log();
+      console.log(chalk.dim("  Get a token from @BotFather on Telegram:"));
+      console.log(chalk.cyan("    https://t.me/BotFather"));
+      process.exit(1);
+    }
+
+    const relayHost = (process.env["CODEHIVE_RELAY_HOST"]
+      ?? config["relayHost"]
+      ?? DEFAULT_RELAY_HOST) as string;
+    const relayPort = parseInt(
+      (process.env["CODEHIVE_RELAY_PORT"]
+        ?? String(config["relayPort"] ?? DEFAULT_RELAY_PORT)) as string,
+      10,
+    );
+    const devName = (process.env["CODEHIVE_DEV_NAME"]
+      ?? config["devName"]
+      ?? "TelegramBot") as string;
+    const chatId = config["telegramChatId"]
+      ? parseInt(String(config["telegramChatId"]), 10)
+      : undefined;
+
+    if (options.background) {
+      try {
+        const child = spawn("node", [process.argv[1]!, "telegram"], {
+          detached: true,
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            CODEHIVE_TELEGRAM_TOKEN: token,
+            CODEHIVE_RELAY_HOST: relayHost,
+            CODEHIVE_RELAY_PORT: String(relayPort),
+            CODEHIVE_DEV_NAME: devName,
+          },
+        });
+        child.unref();
+        console.log(chalk.green("  \u2713") + " Telegram bot started in background");
+        return;
+      } catch {
+        console.error(chalk.red("  \u2717 Failed to start Telegram bot in background"));
+        process.exit(1);
+      }
+    }
+
+    // Foreground mode
+    console.log(BANNER);
+    console.log(chalk.dim("  Starting Telegram bot bridge..."));
+    console.log();
+
+    const { TelegramBot } = await import("../telegram/bot.js");
+    const bot = new TelegramBot({
+      token,
+      relayHost,
+      relayPort,
+      devName,
+      projectPath,
+      chatId,
+    });
+
+    try {
+      await bot.start();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`  \u2717 Failed to start bot: ${msg}`));
+      console.log(chalk.dim("  Check your bot token and try again."));
+      process.exit(1);
+    }
+
+    console.log();
+    console.log(chalk.green("  \u2713") + " Telegram bot is running!");
+    console.log(chalk.dim("  Send /start to your bot in Telegram to begin."));
+    console.log(chalk.dim("  Press Ctrl+C to stop."));
+
+    const shutdown = (): void => {
+      void bot.stop().then(() => process.exit(0));
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   });
 
 // ---------------------------------------------------------------------------
