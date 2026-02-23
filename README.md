@@ -10,8 +10,8 @@
 
 ### Real-time multi-developer collaboration for Claude Code
 
-**See your teammates' changes. Get conflict warnings. Chat from the terminal.**
-**Works on any project. Local or remote.**
+**See your teammates' changes. Lock files. Get conflict warnings. Share terminal output.**
+**Git branch awareness. Activity timeline. Webhook notifications. Works on any project.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-green.svg)](https://nodejs.org)
@@ -250,18 +250,28 @@ codehive init            # adds .mcp.json (60 bytes), touches nothing else
 
 ## Features
 
-### 8 Claude Code tools
+### 14 MCP Tools + 2 Live Resources
 
 | Tool | What it does |
 |------|-------------|
-| `create_room` | Create a new collaboration room, get a shareable code |
-| `join_room` | Join a room with a code like `HIVE-A3K7` |
+| `create_room` | Create a room with optional password, public visibility, and expiry |
+| `join_room` | Join a room with a code like `HIVE-A3K7XY` |
 | `leave_room` | Leave the current room |
-| `get_team_status` | See who's connected, their status, and their current files |
+| `get_team_status` | See members, their git branch, cursor position, and working files |
 | `get_recent_changes` | View teammates' file changes with line-by-line diffs |
-| `send_message` | Send a chat message to all teammates in the room |
-| `declare_working` | Declare which files you're editing (triggers conflict alerts) |
-| `get_notifications` | Check unread notifications (changes, messages, warnings) |
+| `send_message` | Send a chat message to all teammates |
+| `declare_working` | Declare files you're editing (triggers conflict alerts) |
+| `get_notifications` | Check unread notifications (changes, messages, locks, warnings) |
+| `lock_file` | Lock a file so only you can edit it |
+| `unlock_file` | Unlock a previously locked file |
+| `get_timeline` | View chronological activity: joins, leaves, changes, locks |
+| `share_terminal` | Share terminal output (tests, builds) with teammates |
+| `browse_rooms` | Discover public rooms on the relay |
+| `set_webhook` | Configure Slack/Discord webhook for room events |
+
+**MCP Resources** (live subscribable data):
+- `codehive://room/status` — real-time room state
+- `codehive://notifications` — unread notification feed
 
 ### Conflict detection
 
@@ -280,6 +290,57 @@ codehive init            # adds .mcp.json (60 bytes), touches nothing else
             │  merge conflicts!       │
             └─────────────────────────┘
             (sent to BOTH developers)
+```
+
+### File locking
+
+```
+You: "Lock src/config.ts so nobody else changes it"
+
+Claude: Locked src/config.ts. Only you can edit it now.
+
+# If a teammate tries to edit it:
+#   ⚠ File "src/config.ts" is locked by Alice
+```
+
+### Git branch awareness
+
+```
+Room HIVE-A3K7XY — 2 members:
+
+  Alice (active) [main]
+    Working on: src/auth.ts
+
+  Bob (active) [feature/api]
+    Working on: src/routes.ts
+
+⚠ BRANCH WARNING: Team members are on different branches:
+  Alice: main, Bob: feature/api. Coordinate before merging.
+```
+
+### Activity timeline
+
+```
+You: "Show me the room timeline"
+
+Activity timeline:
+  + [14:20:01] Zeus joined the room
+  + [14:21:15] Alice joined the room
+  ~ [14:22:03] Zeus changed src/auth.ts
+  # [14:23:11] Alice locked src/config.ts
+  > [14:24:02] Zeus: "Done with auth module"
+  . [14:25:30] Alice unlocked src/config.ts
+```
+
+### Terminal output sharing
+
+```
+You: "Share the test results with the team"
+
+Claude: Shared terminal output: `npm test` (42 chars)
+
+# Teammates see:
+#   [Terminal] Alice shared: `npm test` (exit 0)
 ```
 
 ### Real-time file watching
@@ -379,7 +440,7 @@ codehive uninstall                         # Remove from Claude Code config
   │
   ├── mcp/                 Claude Code integration
   │   ├── client.ts        WebSocket client (auto-reconnect, heartbeat)
-  │   ├── tools.ts         8 MCP tools registered for Claude Code
+  │   ├── tools.ts         14 MCP tools + 2 resources for Claude Code
   │   └── index.ts         MCP server entry point (stdio transport)
   │
   ├── watcher/             File system monitoring
@@ -466,6 +527,18 @@ pm2 save
 ```
 
 Commit this file. When teammates clone the project, CodeHive is pre-configured.
+
+### `codehive.json` (optional project config)
+
+```json
+{
+  "relayHost": "my-relay.fly.dev",
+  "relayPort": 4819,
+  "devName": "Alice"
+}
+```
+
+Place in your project root. Falls back to environment variables if not present.
 
 ---
 

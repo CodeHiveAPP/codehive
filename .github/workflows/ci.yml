@@ -33,3 +33,6 @@ jobs:
 
       - name: Verify CLI
         run: node bin/codehive.js --help
+
+      - name: Run E2E tests
+        run: npm test

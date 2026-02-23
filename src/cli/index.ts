@@ -3,12 +3,13 @@
  *
  * Main entry point for all CodeHive commands:
  *
- *   codehive init                → Auto-setup: configures Claude Code + starts local relay
+ *   codehive init                → Auto-setup: configures your AI editor + starts local relay
  *   codehive init --relay <url>  → Configure with a remote relay (for remote teams)
+ *   codehive init --editor <ed>  → Force a specific editor (claude-code, cursor, windsurf, copilot)
  *   codehive relay               → Start the relay server (foreground)
  *   codehive relay --background  → Start the relay server in background
  *   codehive deploy              → Deploy relay to the cloud (Fly.io / Docker)
- *   codehive uninstall           → Remove CodeHive from Claude Code config
+ *   codehive uninstall           → Remove CodeHive from editor config
  *   codehive status              → Show current configuration and relay status
  *   codehive doctor              → Full diagnostics
  */
@@ -31,7 +32,9 @@ import {
   DEFAULT_RELAY_PORT,
 } from "../shared/protocol.js";
 
-const VERSION = "1.0.0";
+import { createRequire } from "node:module";
+const _require = createRequire(import.meta.url);
+const { version: VERSION } = _require("../../package.json") as { version: string };
 
 const BANNER = `
   ${chalk.hex("#FFB800").bold("  ____          _      _   _ _")}
@@ -39,15 +42,101 @@ const BANNER = `
   ${chalk.hex("#FFB800").bold("| |   / _ \\ / _\\` |/ _ \\ |_| | \\ \\ / / _ \\")}
   ${chalk.hex("#FFB800").bold("| |__| (_) | (_| |  __/  _  | |\\ V /  __/")}
   ${chalk.hex("#FFB800").bold(" \\____\\___/ \\__,_|\\___|_| |_|_| \\_/ \\___|")}
-  ${chalk.dim("v" + VERSION + " — Real-time collaboration for Claude Code")}
+  ${chalk.dim("v" + VERSION + " — Real-time collaboration for AI-powered coding")}
 `;
+
+// ---------------------------------------------------------------------------
+// Supported editors
+// ---------------------------------------------------------------------------
+
+type EditorId = "claude-code" | "cursor" | "windsurf" | "copilot";
+
+interface EditorConfig {
+  name: string;
+  projectConfig: string;
+  globalConfig: string;
+  configKey: string;
+}
+
+const EDITORS: Record<EditorId, EditorConfig> = {
+  "claude-code": {
+    name: "Claude Code",
+    projectConfig: ".mcp.json",
+    globalConfig: join(homedir(), ".claude.json"),
+    configKey: "mcpServers",
+  },
+  cursor: {
+    name: "Cursor",
+    projectConfig: ".cursor/mcp.json",
+    globalConfig: join(homedir(), ".cursor", "mcp.json"),
+    configKey: "mcpServers",
+  },
+  windsurf: {
+    name: "Windsurf",
+    projectConfig: ".windsurf/mcp.json",
+    globalConfig: join(homedir(), ".codeium", "windsurf", "mcp_config.json"),
+    configKey: "mcpServers",
+  },
+  copilot: {
+    name: "VS Code + Copilot",
+    projectConfig: ".vscode/mcp.json",
+    globalConfig: join(homedir(), ".vscode", "mcp.json"),
+    configKey: "servers",
+  },
+};
+
+const EDITOR_IDS = Object.keys(EDITORS) as EditorId[];
+
+/** Try to find a binary by name. Returns true if found. */
+function isBinaryAvailable(name: string): boolean {
+  try {
+    const cmd = process.platform === "win32"
+      ? `where ${name} 2>nul`
+      : `which ${name} 2>/dev/null`;
+    execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Detect which editors are available on this system. */
+function detectEditors(): EditorId[] {
+  const detected: EditorId[] = [];
+
+  // Claude Code: check for ~/.claude directory or claude binary
+  const claudeDir = join(homedir(), ".claude");
+  if (existsSync(claudeDir) || isBinaryAvailable("claude")) {
+    detected.push("claude-code");
+  }
+
+  // Cursor: check for ~/.cursor directory or cursor binary
+  const cursorDir = join(homedir(), ".cursor");
+  if (existsSync(cursorDir) || isBinaryAvailable("cursor")) {
+    detected.push("cursor");
+  }
+
+  // Windsurf: check for ~/.codeium directory or windsurf binary
+  const codeiumDir = join(homedir(), ".codeium");
+  if (existsSync(codeiumDir) || isBinaryAvailable("windsurf")) {
+    detected.push("windsurf");
+  }
+
+  // VS Code + Copilot: check for ~/.vscode directory or code binary
+  const vscodeDir = join(homedir(), ".vscode");
+  if (existsSync(vscodeDir) || isBinaryAvailable("code")) {
+    detected.push("copilot");
+  }
+
+  return detected;
+}
 
 const program = new Command();
 
 program
   .name("codehive")
   .version(VERSION)
-  .description("Real-time multi-developer collaboration for Claude Code");
+  .description("Real-time multi-developer collaboration for AI-powered coding");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -62,9 +151,11 @@ function findRelayBin(): string {
 
   // Fallback: try global
   try {
-    return execSync("which codehive-relay 2>/dev/null || where codehive-relay 2>nul", {
-      encoding: "utf-8",
-    }).trim().split("\n")[0]!;
+    const whichCmd = process.platform === "win32"
+      ? "where codehive-relay 2>nul"
+      : "which codehive-relay 2>/dev/null";
+    return execSync(whichCmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] })
+      .trim().split("\n")[0]!;
   } catch {
     return "";
   }
@@ -84,7 +175,7 @@ async function isRelayReachable(host: string, port: number): Promise<boolean> {
 
     ws.on("open", () => {
       clearTimeout(timer);
-      ws.close();
+      ws.terminate();
       res(true);
     });
 
@@ -95,17 +186,22 @@ async function isRelayReachable(host: string, port: number): Promise<boolean> {
   });
 }
 
-/** Parse a relay URL like ws://host:port or host:port. */
+/** Parse a relay URL like ws://host:port or host:port. Supports IPv6. */
 function parseRelayUrl(url: string): { host: string; port: number } {
-  const cleaned = url.replace(/^wss?:\/\//, "");
-  const parts = cleaned.split(":");
-  const host = parts[0] || DEFAULT_RELAY_HOST;
-  const port = parts[1] ? parseInt(parts[1], 10) : DEFAULT_RELAY_PORT;
-  return { host, port };
+  const normalized = url.startsWith("ws") ? url : `ws://${url}`;
+  try {
+    const parsed = new URL(normalized);
+    return {
+      host: parsed.hostname || DEFAULT_RELAY_HOST,
+      port: parsed.port ? parseInt(parsed.port, 10) : DEFAULT_RELAY_PORT,
+    };
+  } catch {
+    return { host: DEFAULT_RELAY_HOST, port: DEFAULT_RELAY_PORT };
+  }
 }
 
 /** Start the relay server as a detached background process. */
-function startRelayBackground(port: number): boolean {
+function startRelayBackground(port: number, host: string = "127.0.0.1"): boolean {
   const relayBin = findRelayBin();
   if (!relayBin) return false;
 
@@ -115,7 +211,7 @@ function startRelayBackground(port: number): boolean {
       stdio: "ignore",
       env: {
         ...process.env,
-        CODEHIVE_HOST: "127.0.0.1",
+        CODEHIVE_HOST: host,
         CODEHIVE_PORT: String(port),
       },
     });
@@ -144,17 +240,69 @@ function writeJsonConfig(path: string, config: Record<string, unknown>): void {
   writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf-8");
 }
 
+/** Configure a single editor. */
+function configureEditor(
+  editorId: EditorId,
+  isGlobal: boolean,
+  relayHost: string,
+  relayPort: number,
+  devName: string,
+): string {
+  const editor = EDITORS[editorId];
+  const configPath = isGlobal
+    ? editor.globalConfig
+    : resolve(process.cwd(), editor.projectConfig);
+
+  const env: Record<string, string> = {
+    CODEHIVE_RELAY_HOST: relayHost,
+    CODEHIVE_RELAY_PORT: String(relayPort),
+    CODEHIVE_DEV_NAME: devName,
+  };
+
+  const mcpConfig: Record<string, unknown> = {
+    command: "npx",
+    args: ["-y", "codehive", "mcp-server"],
+    env,
+  };
+
+  // Find codehive-mcp binary for local installs
+  try {
+    const whichCmd = process.platform === "win32"
+      ? "where codehive-mcp 2>nul"
+      : "which codehive-mcp 2>/dev/null";
+    const binPath = execSync(whichCmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] })
+      .trim().split("\n")[0];
+    if (binPath) {
+      mcpConfig.command = "codehive-mcp";
+      mcpConfig.args = [];
+    }
+  } catch {
+    // Keep npx fallback
+  }
+
+  const config = readJsonConfig(configPath);
+  const key = editor.configKey;
+  if (!config[key] || typeof config[key] !== "object") {
+    config[key] = {};
+  }
+  (config[key] as Record<string, unknown>)["codehive"] = mcpConfig;
+
+  writeJsonConfig(configPath, config);
+  return configPath;
+}
+
 // ---------------------------------------------------------------------------
 // codehive init
 // ---------------------------------------------------------------------------
 
 program
   .command("init")
-  .description("Set up CodeHive for your project (auto-configures Claude Code + starts relay)")
+  .description("Set up CodeHive for your project (auto-detects and configures your AI editor)")
   .option("--relay <url>", "Remote relay URL (e.g. ws://relay.example.com:4819)")
   .option("--port <port>", "Local relay port", String(DEFAULT_RELAY_PORT))
   .option("--name <name>", "Your display name")
-  .option("--global", "Install globally in ~/.claude.json instead of project .mcp.json")
+  .option("--global", "Install globally instead of per-project")
+  .option("--editor <editor>", "Force a specific editor (claude-code, cursor, windsurf, copilot)")
   .option("--no-auto-relay", "Don't auto-start a local relay server")
   .action(async (options) => {
     console.log(BANNER);
@@ -171,7 +319,6 @@ program
     // Step 1: Determine relay server
     // ---------------------------------------------------------------
     if (options.relay) {
-      // Remote relay specified
       const parsed = parseRelayUrl(options.relay);
       relayHost = parsed.host;
       relayPort = parsed.port;
@@ -180,7 +327,6 @@ program
       console.log(chalk.white("  [1/3] Relay server"));
       console.log(chalk.dim(`    Using remote relay: ws://${relayHost}:${relayPort}`));
 
-      // Check connectivity
       const reachable = await isRelayReachable(relayHost, relayPort);
       if (reachable) {
         console.log(chalk.green("    ✓ Relay is reachable"));
@@ -188,7 +334,6 @@ program
         console.log(chalk.yellow("    ⚠ Relay is not reachable right now (will retry when you connect)"));
       }
     } else {
-      // Local relay
       relayHost = "127.0.0.1";
       relayPort = parseInt(options.port, 10);
 
@@ -198,10 +343,8 @@ program
       if (alreadyRunning) {
         console.log(chalk.green(`    ✓ Local relay already running on port ${relayPort}`));
       } else if (options.autoRelay !== false) {
-        // Auto-start relay in background
         const started = startRelayBackground(relayPort);
         if (started) {
-          // Wait a bit for it to start
           await new Promise((r) => setTimeout(r, 1500));
           const nowRunning = await isRelayReachable(relayHost, relayPort);
           if (nowRunning) {
@@ -220,51 +363,40 @@ program
     console.log();
 
     // ---------------------------------------------------------------
-    // Step 2: Write MCP config
+    // Step 2: Detect and configure editors
     // ---------------------------------------------------------------
-    console.log(chalk.white("  [2/3] Claude Code configuration"));
+    console.log(chalk.white("  [2/3] Editor configuration"));
 
-    const configPath = isGlobal
-      ? join(homedir(), ".claude.json")
-      : resolve(process.cwd(), ".mcp.json");
+    let targetEditors: EditorId[];
 
-    const env: Record<string, string> = {
-      CODEHIVE_RELAY_HOST: relayHost,
-      CODEHIVE_RELAY_PORT: String(relayPort),
-      CODEHIVE_DEV_NAME: devName,
-    };
-
-    const mcpConfig = {
-      command: "npx",
-      args: ["-y", "codehive", "mcp-server"],
-      env,
-    };
-
-    // Find codehive-mcp binary for local installs
-    try {
-      const binPath = execSync(
-        "which codehive-mcp 2>/dev/null || where codehive-mcp 2>nul",
-        { encoding: "utf-8" },
-      ).trim().split("\n")[0];
-      if (binPath) {
-        mcpConfig.command = "codehive-mcp";
-        mcpConfig.args = [];
+    if (options.editor) {
+      const editorId = options.editor as EditorId;
+      if (!EDITORS[editorId]) {
+        console.error(chalk.red(`    ✗ Unknown editor: ${editorId}`));
+        console.log(chalk.dim(`    Available: ${EDITOR_IDS.join(", ")}`));
+        process.exit(1);
       }
-    } catch {
-      // Keep npx fallback
+      targetEditors = [editorId];
+    } else {
+      // Auto-detect
+      targetEditors = detectEditors();
+
+      if (targetEditors.length === 0) {
+        // Fallback: configure for all via .mcp.json (Claude Code format, widely supported)
+        console.log(chalk.dim("    No specific editor detected — using standard MCP config (.mcp.json)"));
+        targetEditors = ["claude-code"];
+      }
     }
 
-    const config = readJsonConfig(configPath);
-    if (!config["mcpServers"] || typeof config["mcpServers"] !== "object") {
-      config["mcpServers"] = {};
+    const configuredPaths: string[] = [];
+    for (const editorId of targetEditors) {
+      const editor = EDITORS[editorId];
+      const configPath = configureEditor(editorId, isGlobal, relayHost, relayPort, devName);
+      configuredPaths.push(configPath);
+      console.log(chalk.green("    ✓") + ` ${editor.name} configured`);
+      console.log(chalk.dim(`      ${configPath}`));
     }
-    (config["mcpServers"] as Record<string, unknown>)["codehive"] = mcpConfig;
 
-    writeJsonConfig(configPath, config);
-
-    const scope = isGlobal ? "global" : "project";
-    console.log(chalk.green("    ✓") + ` MCP server registered (${scope})`);
-    console.log(chalk.dim(`      ${configPath}`));
     console.log();
 
     // ---------------------------------------------------------------
@@ -272,9 +404,11 @@ program
     // ---------------------------------------------------------------
     console.log(chalk.white("  [3/3] Ready!"));
     console.log();
+
+    const editorNames = targetEditors.map((id) => EDITORS[id].name).join(", ");
     console.log(chalk.white("  ┌─────────────────────────────────────────────────────┐"));
     console.log(chalk.white("  │                                                     │"));
-    console.log(chalk.white("  │  In Claude Code, just say:                          │"));
+    console.log(chalk.white("  │  In your AI editor, just say:                       │"));
     console.log(chalk.white("  │                                                     │"));
     console.log(chalk.white("  │    ") + chalk.cyan('"Create a CodeHive collaboration room"') + chalk.white("    │"));
     console.log(chalk.white("  │                                                     │"));
@@ -284,6 +418,9 @@ program
     console.log(chalk.white("  │    ") + chalk.cyan('"Join CodeHive room HIVE-XXXX"') + chalk.white("             │"));
     console.log(chalk.white("  │                                                     │"));
     console.log(chalk.white("  └─────────────────────────────────────────────────────┘"));
+    console.log();
+    console.log(chalk.dim(`  Configured for: ${editorNames}`));
+    console.log(chalk.dim("  Works with: Claude Code, Cursor, Windsurf, VS Code + Copilot"));
     console.log();
 
     if (isRemote) {
@@ -318,7 +455,7 @@ program
     }
 
     if (options.background) {
-      const started = startRelayBackground(port);
+      const started = startRelayBackground(port, host);
       if (started) {
         console.log(chalk.green("  ✓") + ` Relay started in background on port ${port}`);
       } else {
@@ -402,32 +539,44 @@ program
 
 program
   .command("uninstall")
-  .description("Remove CodeHive from Claude Code configuration")
-  .option("--global", "Remove from global ~/.claude.json")
+  .description("Remove CodeHive from all configured editors")
+  .option("--global", "Remove from global configs")
+  .option("--editor <editor>", "Remove from a specific editor only")
   .action((options) => {
     const isGlobal = options.global === true;
-    const configPath = isGlobal
-      ? join(homedir(), ".claude.json")
-      : resolve(process.cwd(), ".mcp.json");
+    const targetEditors = options.editor
+      ? [options.editor as EditorId]
+      : EDITOR_IDS;
 
-    if (!existsSync(configPath)) {
-      console.log(chalk.yellow("  ⚠ Config file not found: " + configPath));
-      return;
+    let removed = 0;
+
+    for (const editorId of targetEditors) {
+      const editor = EDITORS[editorId];
+      if (!editor) continue;
+
+      const configPath = isGlobal
+        ? editor.globalConfig
+        : resolve(process.cwd(), editor.projectConfig);
+
+      if (!existsSync(configPath)) continue;
+
+      try {
+        const config = readJsonConfig(configPath);
+        const servers = config[editor.configKey] as Record<string, unknown> | undefined;
+
+        if (servers?.["codehive"]) {
+          delete servers["codehive"];
+          writeJsonConfig(configPath, config);
+          console.log(chalk.green("  ✓") + ` CodeHive removed from ${editor.name} (${configPath})`);
+          removed++;
+        }
+      } catch {
+        // Skip this editor
+      }
     }
 
-    try {
-      const config = readJsonConfig(configPath);
-      const servers = config["mcpServers"] as Record<string, unknown> | undefined;
-
-      if (servers?.["codehive"]) {
-        delete servers["codehive"];
-        writeJsonConfig(configPath, config);
-        console.log(chalk.green("  ✓") + " CodeHive removed from " + configPath);
-      } else {
-        console.log(chalk.yellow("  ⚠ CodeHive not found in config"));
-      }
-    } catch {
-      console.error(chalk.red("  ✗ Failed to parse config file"));
+    if (removed === 0) {
+      console.log(chalk.yellow("  ⚠ CodeHive not found in any editor config"));
     }
   });
 
@@ -441,23 +590,27 @@ program
   .action(async () => {
     console.log(BANNER);
     console.log();
-
-    const projectConfig = resolve(process.cwd(), ".mcp.json");
-    const globalConfig = join(homedir(), ".claude.json");
-
-    console.log(chalk.white("  Configuration:"));
+    console.log(chalk.white("  Editor configurations:"));
 
     let relayHost = DEFAULT_RELAY_HOST;
     let relayPort = DEFAULT_RELAY_PORT;
+    let anyConfigured = false;
 
-    for (const [label, path] of [["Project", projectConfig], ["Global", globalConfig]] as const) {
-      if (existsSync(path)) {
+    for (const editorId of EDITOR_IDS) {
+      const editor = EDITORS[editorId];
+      const projectPath = resolve(process.cwd(), editor.projectConfig);
+      const globalPath = editor.globalConfig;
+
+      for (const [label, path] of [["Project", projectPath], ["Global", globalPath]] as const) {
+        if (!existsSync(path)) continue;
+
         const config = readJsonConfig(path);
-        const servers = config["mcpServers"] as Record<string, unknown> | undefined;
+        const servers = config[editor.configKey] as Record<string, unknown> | undefined;
         const hive = servers?.["codehive"] as Record<string, unknown> | undefined;
 
         if (hive) {
-          console.log(chalk.green(`    ✓ ${label}`) + chalk.dim(` → ${path}`));
+          anyConfigured = true;
+          console.log(chalk.green(`    ✓ ${editor.name} (${label})`) + chalk.dim(` → ${path}`));
           const hiveEnv = hive["env"] as Record<string, string> | undefined;
           if (hiveEnv) {
             if (hiveEnv["CODEHIVE_RELAY_HOST"]) relayHost = hiveEnv["CODEHIVE_RELAY_HOST"];
@@ -467,12 +620,12 @@ program
             }
             console.log(chalk.dim(`      Relay: ws://${relayHost}:${relayPort}`));
           }
-        } else {
-          console.log(chalk.dim(`    - ${label}: not configured`));
         }
-      } else {
-        console.log(chalk.dim(`    - ${label}: no config file`));
       }
+    }
+
+    if (!anyConfigured) {
+      console.log(chalk.dim("    No editor configured. Run: codehive init"));
     }
 
     console.log();
@@ -515,28 +668,42 @@ program
 
     // Check if codehive-mcp is available
     try {
-      execSync("which codehive-mcp 2>/dev/null || where codehive-mcp 2>nul", {
-        encoding: "utf-8",
-      });
+      const whichMcp = process.platform === "win32"
+        ? "where codehive-mcp 2>nul"
+        : "which codehive-mcp 2>/dev/null";
+      execSync(whichMcp, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
       console.log(chalk.green("  ✓") + " codehive-mcp binary found");
     } catch {
       console.log(chalk.yellow("  ~") + " codehive-mcp not in PATH (will use npx fallback)");
     }
 
-    // Check config files
-    const projectConfig = resolve(process.cwd(), ".mcp.json");
-    const globalConfig = join(homedir(), ".claude.json");
+    // Detect editors
+    const detected = detectEditors();
+    if (detected.length > 0) {
+      const names = detected.map((id) => EDITORS[id].name).join(", ");
+      console.log(chalk.green("  ✓") + ` Editors detected: ${names}`);
+    } else {
+      console.log(chalk.yellow("  ~") + " No AI editors detected (will use standard .mcp.json)");
+    }
+
+    // Check config files for all editors
     let configFound = false;
     let relayHost = DEFAULT_RELAY_HOST;
     let relayPort = DEFAULT_RELAY_PORT;
 
-    for (const path of [projectConfig, globalConfig]) {
-      if (existsSync(path)) {
+    for (const editorId of EDITOR_IDS) {
+      const editor = EDITORS[editorId];
+      const projectPath = resolve(process.cwd(), editor.projectConfig);
+      const globalPath = editor.globalConfig;
+
+      for (const path of [projectPath, globalPath]) {
+        if (!existsSync(path)) continue;
         const config = readJsonConfig(path);
-        const servers = config["mcpServers"] as Record<string, unknown> | undefined;
+        const servers = config[editor.configKey] as Record<string, unknown> | undefined;
         const hive = servers?.["codehive"] as Record<string, unknown> | undefined;
         if (hive) {
           configFound = true;
+          console.log(chalk.green("  ✓") + ` ${editor.name} MCP config found`);
           const hiveEnv = hive["env"] as Record<string, string> | undefined;
           if (hiveEnv?.["CODEHIVE_RELAY_HOST"]) relayHost = hiveEnv["CODEHIVE_RELAY_HOST"];
           if (hiveEnv?.["CODEHIVE_RELAY_PORT"]) relayPort = parseInt(hiveEnv["CODEHIVE_RELAY_PORT"], 10);
@@ -544,9 +711,7 @@ program
       }
     }
 
-    if (configFound) {
-      console.log(chalk.green("  ✓") + " Claude Code MCP config found");
-    } else {
+    if (!configFound) {
       console.log(chalk.red("  ✗") + " No CodeHive config found — run: codehive init");
       issues++;
     }
@@ -581,15 +746,15 @@ program
   });
 
 // ---------------------------------------------------------------------------
-// codehive mcp-server (hidden — called by Claude Code)
+// codehive mcp-server (hidden — called by AI editors)
 // ---------------------------------------------------------------------------
 
 program
   .command("mcp-server")
-  .description("Start the MCP server (used internally by Claude Code)")
+  .description("Start the MCP server (used internally by AI editors)")
   .action(async () => {
-    // Dynamic import to avoid loading MCP deps for CLI commands
     const { default: startMcp } = await import("../mcp/index.js");
+    await startMcp();
   });
 
 // ---------------------------------------------------------------------------

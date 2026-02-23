@@ -1,8 +1,8 @@
 {
   "name": "codehive",
   "version": "1.0.0",
-  "description": "Real-time multi-developer collaboration for Claude Code via MCP",
-  "author": "",
+  "description": "Real-time multi-developer collaboration for AI-powered coding via MCP",
+  "author": "CodeHive Contributors",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -40,6 +40,7 @@
     "lint": "eslint src/",
     "relay": "node --import tsx src/relay/server.ts",
     "mcp": "node --import tsx src/mcp/index.ts",
+    "test": "node test-runner.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -60,13 +61,18 @@
   },
   "keywords": [
     "claude-code",
+    "cursor",
+    "windsurf",
+    "copilot",
+    "vscode",
     "mcp",
     "collaboration",
     "real-time",
     "multi-developer",
     "websocket",
     "pair-programming",
-    "model-context-protocol"
+    "model-context-protocol",
+    "ai-coding"
   ],
   "repository": {
     "type": "git",

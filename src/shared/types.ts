@@ -28,6 +28,30 @@ export interface DevInfo {
   workingOn: RelativePath[];
   joinedAt: number;
   lastSeen: number;
+  /** Current git branch, if detected. */
+  branch?: string;
+  /** File the dev is currently typing in. */
+  typingIn?: RelativePath | null;
+  /** Cursor position in the editor. */
+  cursor?: CursorPosition | null;
+}
+
+/** Cursor/selection position in a file. */
+export interface CursorPosition {
+  file: RelativePath;
+  line: number;
+  column: number;
+  /** If there's a selection, end position. */
+  endLine?: number;
+  endColumn?: number;
+}
+
+/** A file lock held by a developer. */
+export interface FileLock {
+  file: RelativePath;
+  lockedBy: DevName;
+  deviceId: DeviceId;
+  lockedAt: number;
 }
 
 /** A single file change event from a developer. */
@@ -40,6 +64,18 @@ export interface FileChange {
   diff: string | null;
   linesAdded: number;
   linesRemoved: number;
+  /** For binary files: size in bytes before and after. */
+  sizeBefore?: number | null;
+  sizeAfter?: number | null;
+}
+
+/** A single event in the room activity timeline. */
+export interface TimelineEvent {
+  id: number;
+  timestamp: number;
+  type: "join" | "leave" | "chat" | "file_change" | "lock" | "unlock" | "conflict" | "branch_change";
+  actor: DevName;
+  detail: string;
 }
 
 /** Room metadata visible to all participants. */
@@ -49,6 +85,47 @@ export interface RoomInfo {
   createdBy: DevName;
   members: DevInfo[];
   recentChanges: FileChange[];
+  hasPassword: boolean;
+  /** Files currently locked in the room. */
+  locks: FileLock[];
+  /** Whether the room is publicly discoverable. */
+  isPublic: boolean;
+  /** Room expiry TTL in hours (0 = no expiry). */
+  expiresInHours: number;
+  /** Recent timeline events. */
+  timeline: TimelineEvent[];
+}
+
+/** A file change event for binary files (size-based instead of line-based). */
+export interface FileChangeSize {
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+}
+
+/** Room summary for discovery (no sensitive data). */
+export interface RoomSummary {
+  code: RoomCode;
+  createdBy: DevName;
+  createdAt: number;
+  memberCount: number;
+  memberNames: DevName[];
+  hasPassword: boolean;
+}
+
+/** Webhook configuration for a room. */
+export interface WebhookConfig {
+  url: string;
+  events: string[]; // "all" | "join" | "leave" | "chat" | "file_change" | "conflict"
+}
+
+/** Terminal output shared with teammates. */
+export interface SharedTerminal {
+  command: string;
+  output: string;
+  exitCode: number | null;
+  cwd: string;
+  sharedBy: DevName;
+  timestamp: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +141,16 @@ export type ClientMessageType =
   | "declare_working"
   | "chat_message"
   | "request_status"
-  | "sync_request";
+  | "sync_request"
+  | "declare_typing"
+  | "lock_file"
+  | "unlock_file"
+  | "update_cursor"
+  | "share_terminal"
+  | "list_rooms"
+  | "get_timeline"
+  | "set_webhook"
+  | "set_room_visibility";
 
 export type ServerMessageType =
   | "room_created"
@@ -78,7 +164,16 @@ export type ServerMessageType =
   | "room_status"
   | "conflict_warning"
   | "error"
-  | "heartbeat_ack";
+  | "heartbeat_ack"
+  | "typing_indicator"
+  | "file_locked"
+  | "file_unlocked"
+  | "lock_error"
+  | "cursor_updated"
+  | "terminal_shared"
+  | "room_list"
+  | "timeline"
+  | "branch_warning";
 
 /** Base envelope for all client-to-server messages. */
 export interface ClientMessage<T extends ClientMessageType = ClientMessageType> {
@@ -100,12 +195,18 @@ export interface ServerMessage<T extends ServerMessageType = ServerMessageType> 
 export interface CreateRoomMessage extends ClientMessage<"create_room"> {
   name: DevName;
   projectPath: string;
+  password?: string;
+  isPublic?: boolean;
+  expiresInHours?: number;
+  branch?: string;
 }
 
 export interface JoinRoomMessage extends ClientMessage<"join_room"> {
   code: RoomCode;
   name: DevName;
   projectPath: string;
+  password?: string;
+  branch?: string;
 }
 
 export interface LeaveRoomMessage extends ClientMessage<"leave_room"> {
@@ -115,6 +216,7 @@ export interface LeaveRoomMessage extends ClientMessage<"leave_room"> {
 export interface HeartbeatMessage extends ClientMessage<"heartbeat"> {
   code: RoomCode;
   status: DevStatus;
+  branch?: string;
 }
 
 export interface FileChangeMessage extends ClientMessage<"file_change"> {
@@ -142,6 +244,53 @@ export interface SyncRequestMessage extends ClientMessage<"sync_request"> {
   code: RoomCode;
 }
 
+export interface DeclareTypingMessage extends ClientMessage<"declare_typing"> {
+  code: RoomCode;
+  name: DevName;
+  file: RelativePath | null;
+}
+
+export interface LockFileMessage extends ClientMessage<"lock_file"> {
+  code: RoomCode;
+  name: DevName;
+  file: RelativePath;
+}
+
+export interface UnlockFileMessage extends ClientMessage<"unlock_file"> {
+  code: RoomCode;
+  name: DevName;
+  file: RelativePath;
+}
+
+export interface UpdateCursorMessage extends ClientMessage<"update_cursor"> {
+  code: RoomCode;
+  name: DevName;
+  cursor: CursorPosition | null;
+}
+
+export interface ShareTerminalMessage extends ClientMessage<"share_terminal"> {
+  code: RoomCode;
+  name: DevName;
+  terminal: SharedTerminal;
+}
+
+export interface ListRoomsMessage extends ClientMessage<"list_rooms"> {}
+
+export interface GetTimelineMessage extends ClientMessage<"get_timeline"> {
+  code: RoomCode;
+  limit?: number;
+}
+
+export interface SetWebhookMessage extends ClientMessage<"set_webhook"> {
+  code: RoomCode;
+  webhook: WebhookConfig | null;
+}
+
+export interface SetRoomVisibilityMessage extends ClientMessage<"set_room_visibility"> {
+  code: RoomCode;
+  isPublic: boolean;
+}
+
 /** Union of every possible client message. */
 export type AnyClientMessage =
   | CreateRoomMessage
@@ -152,7 +301,16 @@ export type AnyClientMessage =
   | DeclareWorkingMessage
   | ChatSendMessage
   | RequestStatusMessage
-  | SyncRequestMessage;
+  | SyncRequestMessage
+  | DeclareTypingMessage
+  | LockFileMessage
+  | UnlockFileMessage
+  | UpdateCursorMessage
+  | ShareTerminalMessage
+  | ListRoomsMessage
+  | GetTimelineMessage
+  | SetWebhookMessage
+  | SetRoomVisibilityMessage;
 
 // ---------------------------------------------------------------------------
 // Server → Client payloads
@@ -160,6 +318,7 @@ export type AnyClientMessage =
 
 export interface RoomCreatedMessage extends ServerMessage<"room_created"> {
   room: RoomInfo;
+  inviteLink: string;
 }
 
 export interface RoomJoinedMessage extends ServerMessage<"room_joined"> {
@@ -216,6 +375,56 @@ export interface HeartbeatAckMessage extends ServerMessage<"heartbeat_ack"> {
   code: RoomCode;
 }
 
+export interface TypingIndicatorMessage extends ServerMessage<"typing_indicator"> {
+  code: RoomCode;
+  name: DevName;
+  file: RelativePath | null;
+}
+
+export interface FileLockedMessage extends ServerMessage<"file_locked"> {
+  code: RoomCode;
+  lock: FileLock;
+}
+
+export interface FileUnlockedMessage extends ServerMessage<"file_unlocked"> {
+  code: RoomCode;
+  file: RelativePath;
+  unlockedBy: DevName;
+}
+
+export interface LockErrorMessage extends ServerMessage<"lock_error"> {
+  code: RoomCode;
+  file: RelativePath;
+  error: string;
+  lockedBy: DevName;
+}
+
+export interface CursorUpdatedMessage extends ServerMessage<"cursor_updated"> {
+  code: RoomCode;
+  name: DevName;
+  cursor: CursorPosition | null;
+}
+
+export interface TerminalSharedMessage extends ServerMessage<"terminal_shared"> {
+  code: RoomCode;
+  terminal: SharedTerminal;
+}
+
+export interface RoomListMessage extends ServerMessage<"room_list"> {
+  rooms: RoomSummary[];
+}
+
+export interface TimelineMessage extends ServerMessage<"timeline"> {
+  code: RoomCode;
+  events: TimelineEvent[];
+}
+
+export interface BranchWarningMessage extends ServerMessage<"branch_warning"> {
+  code: RoomCode;
+  message: string;
+  branches: Record<DevName, string>;
+}
+
 /** Union of every possible server message. */
 export type AnyServerMessage =
   | RoomCreatedMessage
@@ -229,4 +438,13 @@ export type AnyServerMessage =
   | RoomStatusMessage
   | ConflictWarningMessage
   | ErrorMessage
-  | HeartbeatAckMessage;
+  | HeartbeatAckMessage
+  | TypingIndicatorMessage
+  | FileLockedMessage
+  | FileUnlockedMessage
+  | LockErrorMessage
+  | CursorUpdatedMessage
+  | TerminalSharedMessage
+  | RoomListMessage
+  | TimelineMessage
+  | BranchWarningMessage;

@@ -1,14 +1,14 @@
 /**
  * CodeHive MCP Tool Definitions
  *
- * Registers all tools that Claude Code can call to interact with
- * the collaboration system. Each tool maps to a user intent like
- * "create a room", "see who's online", "send a message", etc.
+ * Registers all MCP tools that AI editors (Claude Code, Cursor,
+ * Windsurf, VS Code + Copilot) can call to interact with the
+ * collaboration system.
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { AnyServerMessage, RoomInfo } from "../shared/types.js";
+import type { RoomInfo, RoomSummary, TimelineEvent, SharedTerminal } from "../shared/types.js";
 import { isValidRoomCode, formatTime } from "../shared/utils.js";
 import type { RelayClient } from "./client.js";
 import type { FileWatcher } from "../watcher/index.js";
@@ -24,7 +24,7 @@ export interface ToolState {
 }
 
 /**
- * Register all CodeHive tools on the given MCP server.
+ * Register all CodeHive tools and resources on the given MCP server.
  */
 export function registerTools(server: McpServer, state: ToolState): void {
   registerCreateRoom(server, state);
@@ -35,6 +35,66 @@ export function registerTools(server: McpServer, state: ToolState): void {
   registerSendMessage(server, state);
   registerDeclareWorking(server, state);
   registerGetNotifications(server, state);
+  registerLockFile(server, state);
+  registerUnlockFile(server, state);
+  registerGetTimeline(server, state);
+  registerShareTerminal(server, state);
+  registerBrowseRooms(server, state);
+  registerSetWebhook(server, state);
+  registerResources(server, state);
+}
+
+// ---------------------------------------------------------------------------
+// MCP Resources — subscribable live data
+// ---------------------------------------------------------------------------
+
+function registerResources(server: McpServer, state: ToolState): void {
+  server.resource(
+    "room-status",
+    "codehive://room/status",
+    { description: "Current room status including members, recent changes, locks, and notifications" },
+    async () => {
+      if (!state.client.roomCode || !state.lastRoomInfo) {
+        return {
+          contents: [{
+            uri: "codehive://room/status",
+            mimeType: "application/json",
+            text: JSON.stringify({ connected: false, room: null }),
+          }],
+        };
+      }
+
+      return {
+        contents: [{
+          uri: "codehive://room/status",
+          mimeType: "application/json",
+          text: JSON.stringify({
+            connected: true,
+            room: state.lastRoomInfo,
+            pendingNotifications: state.pendingNotifications.length,
+          }),
+        }],
+      };
+    },
+  );
+
+  server.resource(
+    "notifications",
+    "codehive://notifications",
+    { description: "Unread notifications from teammates" },
+    async () => {
+      return {
+        contents: [{
+          uri: "codehive://notifications",
+          mimeType: "application/json",
+          text: JSON.stringify({
+            count: state.pendingNotifications.length,
+            notifications: state.pendingNotifications,
+          }),
+        }],
+      };
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -44,9 +104,13 @@ export function registerTools(server: McpServer, state: ToolState): void {
 function registerCreateRoom(server: McpServer, state: ToolState): void {
   server.tool(
     "create_room",
-    "Create a new CodeHive collaboration room. Share the generated room code with your teammates so they can join.",
-    {},
-    async () => {
+    "Create a new CodeHive collaboration room. Optionally set a password, make it public for discovery, or set an expiry time.",
+    {
+      password: z.string().optional().describe("Optional password to protect the room"),
+      is_public: z.boolean().optional().describe("Make the room discoverable by other developers (default: false)"),
+      expires_in_hours: z.number().optional().describe("Auto-delete the room after this many hours of inactivity (0 = never)"),
+    },
+    async ({ password, is_public, expires_in_hours }) => {
       if (state.client.roomCode) {
         return {
           content: [
@@ -58,11 +122,11 @@ function registerCreateRoom(server: McpServer, state: ToolState): void {
         };
       }
 
-      const roomInfo = await waitForRoomEvent(state, () => {
-        state.client.createRoom();
+      const result = await waitForRoomCreatedEvent(state, () => {
+        state.client.createRoom(password, is_public, expires_in_hours);
       });
 
-      if (!roomInfo) {
+      if (!result) {
         return {
           content: [
             { type: "text" as const, text: "Failed to create room. Is the relay server running?" },
@@ -74,6 +138,8 @@ function registerCreateRoom(server: McpServer, state: ToolState): void {
         await state.watcher.start();
       }
 
+      const { roomInfo, inviteLink } = result;
+
       return {
         content: [
           {
@@ -82,12 +148,17 @@ function registerCreateRoom(server: McpServer, state: ToolState): void {
               `Room created successfully!`,
               ``,
               `Room code: ${roomInfo.code}`,
+              password ? `Password protected: yes` : ``,
+              roomInfo.isPublic ? `Visibility: PUBLIC (discoverable)` : `Visibility: PRIVATE`,
+              roomInfo.expiresInHours > 0 ? `Expires: after ${roomInfo.expiresInHours}h of inactivity` : ``,
+              inviteLink ? `Invite link: ${inviteLink}` : ``,
               ``,
-              `Share this code with your teammates. They can join with:`,
+              `Share the room code${password ? " and password" : ""} with your teammates.`,
+              `They can join with:`,
               `  "Join CodeHive room ${roomInfo.code}"`,
               ``,
               `File watching is active. Your teammates will see your changes in real-time.`,
-            ].join("\n"),
+            ].filter(Boolean).join("\n"),
           },
         ],
       };
@@ -103,8 +174,11 @@ function registerJoinRoom(server: McpServer, state: ToolState): void {
   server.tool(
     "join_room",
     "Join an existing CodeHive collaboration room using a room code shared by a teammate.",
-    { code: z.string().describe("The room code to join (e.g. HIVE-A3K7)") },
-    async ({ code }) => {
+    {
+      code: z.string().describe("The room code to join (e.g. HIVE-A3K7XY)"),
+      password: z.string().optional().describe("Room password if the room is protected"),
+    },
+    async ({ code, password }) => {
       const normalized = code.toUpperCase().trim();
 
       if (!isValidRoomCode(normalized)) {
@@ -112,7 +186,7 @@ function registerJoinRoom(server: McpServer, state: ToolState): void {
           content: [
             {
               type: "text" as const,
-              text: `Invalid room code "${code}". Expected format: HIVE-XXXX (e.g. HIVE-A3K7).`,
+              text: `Invalid room code "${code}". Expected format: HIVE-XXXXXX (e.g. HIVE-A3K7XY).`,
             },
           ],
         };
@@ -129,8 +203,8 @@ function registerJoinRoom(server: McpServer, state: ToolState): void {
         };
       }
 
-      const roomInfo = await waitForRoomEvent(state, () => {
-        state.client.joinRoom(normalized);
+      const roomInfo = await waitForRoomJoinEvent(state, () => {
+        state.client.joinRoom(normalized, password);
       });
 
       if (!roomInfo) {
@@ -149,8 +223,15 @@ function registerJoinRoom(server: McpServer, state: ToolState): void {
       }
 
       const memberList = roomInfo.members
-        .map((m) => `  - ${m.name} (${m.status})`)
+        .map((m) => {
+          const branch = m.branch ? ` [${m.branch}]` : "";
+          return `  - ${m.name} (${m.status})${branch}`;
+        })
         .join("\n");
+
+      const lockList = roomInfo.locks.length > 0
+        ? `\nLocked files:\n` + roomInfo.locks.map((l) => `  - ${l.file} (by ${l.lockedBy})`).join("\n")
+        : "";
 
       return {
         content: [
@@ -161,8 +242,11 @@ function registerJoinRoom(server: McpServer, state: ToolState): void {
               ``,
               `Team members:`,
               memberList,
+              lockList,
               ``,
               `File watching is active. You'll be notified of teammates' changes.`,
+              ``,
+              `TIP: Use "check CodeHive notifications" to see updates from teammates.`,
             ].join("\n"),
           },
         ],
@@ -215,7 +299,7 @@ function registerLeaveRoom(server: McpServer, state: ToolState): void {
 function registerGetTeamStatus(server: McpServer, state: ToolState): void {
   server.tool(
     "get_team_status",
-    "See who is connected to the current room, their status, and what files they are working on.",
+    "See who is connected to the current room, their status, git branch, and what files they are working on. Call this before editing files to avoid conflicts with teammates.",
     {},
     async () => {
       if (!state.client.roomCode) {
@@ -239,6 +323,7 @@ function registerGetTeamStatus(server: McpServer, state: ToolState): void {
       const lines: string[] = [
         `Room: ${roomInfo.code}`,
         `Members: ${roomInfo.members.length}`,
+        roomInfo.isPublic ? `Visibility: PUBLIC` : `Visibility: PRIVATE`,
         ``,
       ];
 
@@ -248,10 +333,23 @@ function registerGetTeamStatus(server: McpServer, state: ToolState): void {
             ? member.workingOn.join(", ")
             : "none declared";
         const lastSeen = formatTime(member.lastSeen);
-        lines.push(`  ${member.name}`);
+        const branch = member.branch ? ` [${member.branch}]` : "";
+        const typing = member.typingIn ? ` (typing in ${member.typingIn})` : "";
+        lines.push(`  ${member.name}${branch}${typing}`);
         lines.push(`    Status: ${member.status}`);
         lines.push(`    Working on: ${files}`);
         lines.push(`    Last seen: ${lastSeen}`);
+        if (member.cursor) {
+          lines.push(`    Cursor: ${member.cursor.file}:${member.cursor.line}:${member.cursor.column}`);
+        }
+        lines.push(``);
+      }
+
+      if (roomInfo.locks.length > 0) {
+        lines.push(`Locked files:`);
+        for (const lock of roomInfo.locks) {
+          lines.push(`  - ${lock.file} (by ${lock.lockedBy} at ${formatTime(lock.lockedAt)})`);
+        }
         lines.push(``);
       }
 
@@ -294,7 +392,10 @@ function registerGetRecentChanges(server: McpServer, state: ToolState): void {
 
       for (const change of roomInfo.recentChanges.slice(-15)) {
         const time = formatTime(change.timestamp);
-        const stats = `+${change.linesAdded} -${change.linesRemoved}`;
+        const isBinary = change.sizeAfter !== undefined && change.sizeAfter !== null;
+        const stats = isBinary
+          ? `${Math.round((change.sizeAfter as number) / 1024)}KB`
+          : `+${change.linesAdded} -${change.linesRemoved}`;
         lines.push(`  [${time}] ${change.author} ${change.type} ${change.path} (${stats})`);
 
         if (change.diff) {
@@ -335,13 +436,21 @@ function registerSendMessage(server: McpServer, state: ToolState): void {
         };
       }
 
+      if (message.length > 10_000) {
+        return {
+          content: [
+            { type: "text" as const, text: "Message too long (max 10,000 characters)." },
+          ],
+        };
+      }
+
       state.client.sendChatMessage(message);
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `Message sent to room ${state.client.roomCode}: "${message}"`,
+            text: `Message sent to room ${state.client.roomCode}: "${message}"\n\nTeammates will see it when they check notifications.`,
           },
         ],
       };
@@ -356,7 +465,7 @@ function registerSendMessage(server: McpServer, state: ToolState): void {
 function registerDeclareWorking(server: McpServer, state: ToolState): void {
   server.tool(
     "declare_working",
-    "Declare which files you are currently working on. Teammates will be warned if they try to edit the same files.",
+    "Declare which files you are about to edit. ALWAYS call this before modifying any file so teammates get conflict warnings if they touch the same files.",
     {
       files: z
         .string()
@@ -399,7 +508,7 @@ function registerDeclareWorking(server: McpServer, state: ToolState): void {
 function registerGetNotifications(server: McpServer, state: ToolState): void {
   server.tool(
     "get_notifications",
-    "Check for unread notifications from teammates (file changes, messages, conflict warnings).",
+    "IMPORTANT: Call this tool BEFORE starting any coding task to check for teammate updates. Shows unread notifications: file changes, chat messages, conflict warnings, lock events, and branch warnings.",
     {},
     async () => {
       if (state.pendingNotifications.length === 0) {
@@ -430,66 +539,452 @@ function registerGetNotifications(server: McpServer, state: ToolState): void {
 }
 
 // ---------------------------------------------------------------------------
+// lock_file
+// ---------------------------------------------------------------------------
+
+function registerLockFile(server: McpServer, state: ToolState): void {
+  server.tool(
+    "lock_file",
+    "Lock a file so only you can edit it. Other teammates will be warned if they try to modify a locked file. Use this for critical files to prevent conflicts.",
+    {
+      file: z.string().describe("File path relative to project root (e.g. src/config.ts)"),
+    },
+    async ({ file }) => {
+      if (!state.client.roomCode) {
+        return {
+          content: [
+            { type: "text" as const, text: "Not in a room. Create or join one first." },
+          ],
+        };
+      }
+
+      state.client.lockFile(file.trim());
+
+      // Wait for lock confirmation or error
+      const result = await waitForLockEvent(state, file.trim());
+
+      return {
+        content: [
+          { type: "text" as const, text: result },
+        ],
+      };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// unlock_file
+// ---------------------------------------------------------------------------
+
+function registerUnlockFile(server: McpServer, state: ToolState): void {
+  server.tool(
+    "unlock_file",
+    "Unlock a file you previously locked, allowing teammates to edit it again.",
+    {
+      file: z.string().describe("File path to unlock (e.g. src/config.ts)"),
+    },
+    async ({ file }) => {
+      if (!state.client.roomCode) {
+        return {
+          content: [
+            { type: "text" as const, text: "Not in a room. Create or join one first." },
+          ],
+        };
+      }
+
+      state.client.unlockFile(file.trim());
+
+      return {
+        content: [
+          { type: "text" as const, text: `Unlocked ${file.trim()}. Teammates can now edit it.` },
+        ],
+      };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// get_timeline
+// ---------------------------------------------------------------------------
+
+function registerGetTimeline(server: McpServer, state: ToolState): void {
+  server.tool(
+    "get_timeline",
+    "View the activity timeline for the current room. Shows all events: joins, leaves, file changes, chat messages, locks, and branch changes in chronological order.",
+    {
+      limit: z.number().optional().describe("Number of events to show (default: 30)"),
+    },
+    async ({ limit }) => {
+      if (!state.client.roomCode) {
+        return {
+          content: [
+            { type: "text" as const, text: "Not in a room. Create or join one first." },
+          ],
+        };
+      }
+
+      const events = await waitForTimelineEvent(state, limit ?? 30);
+
+      if (!events || events.length === 0) {
+        return {
+          content: [
+            { type: "text" as const, text: "No activity in the timeline yet." },
+          ],
+        };
+      }
+
+      const lines: string[] = ["Activity timeline:"];
+      for (const event of events) {
+        const time = formatTime(event.timestamp);
+        const icon = getTimelineIcon(event.type);
+        lines.push(`  ${icon} [${time}] ${event.detail}`);
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    },
+  );
+}
+
+function getTimelineIcon(type: TimelineEvent["type"]): string {
+  switch (type) {
+    case "join": return "+";
+    case "leave": return "-";
+    case "chat": return ">";
+    case "file_change": return "~";
+    case "lock": return "#";
+    case "unlock": return ".";
+    case "conflict": return "!";
+    case "branch_change": return "*";
+    default: return " ";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// share_terminal
+// ---------------------------------------------------------------------------
+
+function registerShareTerminal(server: McpServer, state: ToolState): void {
+  server.tool(
+    "share_terminal",
+    "Share terminal command output with your teammates. Useful for sharing test results, build output, or debugging information.",
+    {
+      command: z.string().describe("The command that was run"),
+      output: z.string().describe("The terminal output to share"),
+      exit_code: z.number().optional().describe("The exit code of the command"),
+    },
+    async ({ command, output, exit_code }) => {
+      if (!state.client.roomCode) {
+        return {
+          content: [
+            { type: "text" as const, text: "Not in a room. Create or join one first." },
+          ],
+        };
+      }
+
+      if (output.length > 50_000) {
+        return {
+          content: [
+            { type: "text" as const, text: "Output too large (max 50,000 characters). Truncate before sharing." },
+          ],
+        };
+      }
+
+      const terminal: SharedTerminal = {
+        command,
+        output,
+        exitCode: exit_code ?? null,
+        cwd: state.client.projectPath,
+        sharedBy: state.client.devName,
+        timestamp: Date.now(),
+      };
+
+      state.client.shareTerminal(terminal);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Shared terminal output with teammates: \`${command}\` (${output.length} chars)`,
+          },
+        ],
+      };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// browse_rooms
+// ---------------------------------------------------------------------------
+
+function registerBrowseRooms(server: McpServer, state: ToolState): void {
+  server.tool(
+    "browse_rooms",
+    "Browse public CodeHive rooms available on the relay server. Only shows rooms that have been made public by their creators.",
+    {},
+    async () => {
+      const rooms = await waitForRoomListEvent(state);
+
+      if (!rooms || rooms.length === 0) {
+        return {
+          content: [
+            { type: "text" as const, text: "No public rooms available." },
+          ],
+        };
+      }
+
+      const lines: string[] = [`${rooms.length} public room(s) found:`, ``];
+      for (const room of rooms) {
+        const lock = room.hasPassword ? " [password protected]" : "";
+        lines.push(`  ${room.code} — ${room.memberCount} member(s)${lock}`);
+        lines.push(`    Created by: ${room.createdBy}`);
+        lines.push(`    Members: ${room.memberNames.join(", ")}`);
+        lines.push(``);
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// set_webhook
+// ---------------------------------------------------------------------------
+
+function registerSetWebhook(server: McpServer, state: ToolState): void {
+  server.tool(
+    "set_webhook",
+    "Configure a webhook URL to receive notifications for room events. Events will be POSTed as JSON. Set to empty to remove.",
+    {
+      url: z.string().describe("Webhook URL to POST events to (Slack, Discord, or custom). Empty string to remove."),
+      events: z.string().optional().describe("Comma-separated list of events: all, join, leave, chat, file_change, conflict (default: all)"),
+    },
+    async ({ url, events }) => {
+      if (!state.client.roomCode) {
+        return {
+          content: [
+            { type: "text" as const, text: "Not in a room. Create or join one first." },
+          ],
+        };
+      }
+
+      if (!url) {
+        state.client.setWebhook(null);
+        return {
+          content: [
+            { type: "text" as const, text: "Webhook removed." },
+          ],
+        };
+      }
+
+      const eventList = (events || "all").split(",").map((e) => e.trim()).filter(Boolean);
+
+      state.client.setWebhook({ url, events: eventList });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Webhook configured: ${url}\nEvents: ${eventList.join(", ")}`,
+          },
+        ],
+      };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Wait for a room creation or join event from the relay, with timeout.
- */
-function waitForRoomEvent(
+function waitForRoomCreatedEvent(
   state: ToolState,
   trigger: () => void,
-): Promise<RoomInfo | null> {
+): Promise<{ roomInfo: RoomInfo; inviteLink: string } | null> {
   return new Promise((resolve) => {
+    let settled = false;
+
     const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
       resolve(null);
     }, 10_000);
 
-    const originalHandler = state.client["onMessage"];
-
-    state.client["onMessage"] = (msg: AnyServerMessage) => {
-      originalHandler(msg);
-
-      if (msg.type === "room_created" || msg.type === "room_joined") {
+    const unsub = state.client.onceMessage(
+      (msg) =>
+        msg.type === "room_created" ||
+        msg.type === "error",
+      (msg) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
-        state.lastRoomInfo = msg.room;
-        state.client["onMessage"] = originalHandler;
-        resolve(msg.room);
-      }
 
-      if (msg.type === "error") {
-        clearTimeout(timeout);
-        state.client["onMessage"] = originalHandler;
-        resolve(null);
-      }
-    };
+        if (msg.type === "room_created") {
+          const created = msg as { room: RoomInfo; inviteLink: string };
+          state.lastRoomInfo = created.room;
+          resolve({ roomInfo: created.room, inviteLink: created.inviteLink });
+        } else {
+          resolve(null);
+        }
+      },
+    );
 
     trigger();
   });
 }
 
-/**
- * Request and wait for a status update from the relay.
- */
+function waitForRoomJoinEvent(
+  state: ToolState,
+  trigger: () => void,
+): Promise<RoomInfo | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+      resolve(null);
+    }, 10_000);
+
+    const unsub = state.client.onceMessage(
+      (msg) =>
+        msg.type === "room_joined" ||
+        msg.type === "error",
+      (msg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+
+        if (msg.type === "room_joined") {
+          state.lastRoomInfo = (msg as { room: RoomInfo }).room;
+          resolve((msg as { room: RoomInfo }).room);
+        } else {
+          resolve(null);
+        }
+      },
+    );
+
+    trigger();
+  });
+}
+
 function waitForStatusEvent(state: ToolState): Promise<RoomInfo | null> {
   return new Promise((resolve) => {
+    let settled = false;
+
     const timeout = setTimeout(() => {
-      resolve(state.lastRoomInfo);
+      if (settled) return;
+      settled = true;
+      unsub();
+      if (state.lastRoomInfo) {
+        resolve(state.lastRoomInfo);
+      } else {
+        resolve(null);
+      }
     }, 5_000);
 
-    const originalHandler = state.client["onMessage"];
-
-    state.client["onMessage"] = (msg: AnyServerMessage) => {
-      originalHandler(msg);
-
-      if (msg.type === "room_status") {
+    const unsub = state.client.onceMessage(
+      (msg) => msg.type === "room_status",
+      (msg) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
-        state.lastRoomInfo = msg.room;
-        state.client["onMessage"] = originalHandler;
-        resolve(msg.room);
-      }
-    };
+        state.lastRoomInfo = (msg as { room: RoomInfo }).room;
+        resolve((msg as { room: RoomInfo }).room);
+      },
+    );
 
     state.client.requestStatus();
+  });
+}
+
+function waitForLockEvent(state: ToolState, file: string): Promise<string> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+      resolve(`Lock request sent for ${file}.`);
+    }, 5_000);
+
+    const unsub = state.client.onceMessage(
+      (msg) =>
+        (msg.type === "file_locked" && (msg as { lock: { file: string } }).lock.file === file) ||
+        (msg.type === "lock_error" && (msg as { file: string }).file === file),
+      (msg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+
+        if (msg.type === "file_locked") {
+          resolve(`Locked ${file}. Only you can edit it now. Use unlock_file when done.`);
+        } else {
+          const err = msg as { error: string; lockedBy: string };
+          resolve(`Cannot lock ${file}: ${err.error}`);
+        }
+      },
+    );
+  });
+}
+
+function waitForTimelineEvent(state: ToolState, limit: number): Promise<TimelineEvent[] | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+      // Fallback to cached timeline
+      if (state.lastRoomInfo?.timeline) {
+        resolve(state.lastRoomInfo.timeline);
+      } else {
+        resolve(null);
+      }
+    }, 5_000);
+
+    const unsub = state.client.onceMessage(
+      (msg) => msg.type === "timeline",
+      (msg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve((msg as { events: TimelineEvent[] }).events);
+      },
+    );
+
+    state.client.getTimeline(limit);
+  });
+}
+
+function waitForRoomListEvent(state: ToolState): Promise<RoomSummary[] | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+      resolve(null);
+    }, 5_000);
+
+    const unsub = state.client.onceMessage(
+      (msg) => msg.type === "room_list",
+      (msg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve((msg as { rooms: RoomSummary[] }).rooms);
+      },
+    );
+
+    state.client.listRooms();
   });
 }

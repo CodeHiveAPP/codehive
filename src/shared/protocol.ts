@@ -41,6 +41,24 @@ export const MAX_RECENT_CHANGES = 100;
 /** Maximum number of members per room. */
 export const MAX_ROOM_MEMBERS = 20;
 
+/** Maximum number of timeline events kept per room. */
+export const MAX_TIMELINE_EVENTS = 200;
+
+/** Maximum number of file locks per room. */
+export const MAX_LOCKS_PER_ROOM = 50;
+
+/** Default room expiry TTL in hours (0 = never). */
+export const DEFAULT_ROOM_EXPIRY_HOURS = 0;
+
+/** Room expiry check interval in milliseconds (every 5 minutes). */
+export const ROOM_EXPIRY_CHECK_MS = 5 * 60 * 1000;
+
+/** Typing indicator timeout in milliseconds (auto-clear after 10s). */
+export const TYPING_TIMEOUT_MS = 10_000;
+
+/** Maximum terminal output size in characters. */
+export const MAX_TERMINAL_OUTPUT = 50_000;
+
 /**
  * Serialize a client message to a JSON string for transmission.
  */
@@ -111,6 +129,15 @@ export function isClientMessageType(type: string): type is ClientMessageType {
     "chat_message",
     "request_status",
     "sync_request",
+    "declare_typing",
+    "lock_file",
+    "unlock_file",
+    "update_cursor",
+    "share_terminal",
+    "list_rooms",
+    "get_timeline",
+    "set_webhook",
+    "set_room_visibility",
   ]);
   return valid.has(type);
 }
@@ -132,6 +159,15 @@ export function isServerMessageType(type: string): type is ServerMessageType {
     "conflict_warning",
     "error",
     "heartbeat_ack",
+    "typing_indicator",
+    "file_locked",
+    "file_unlocked",
+    "lock_error",
+    "cursor_updated",
+    "terminal_shared",
+    "room_list",
+    "timeline",
+    "branch_warning",
   ]);
   return valid.has(type);
 }
@@ -141,4 +177,15 @@ export function isServerMessageType(type: string): type is ServerMessageType {
  */
 export function buildRelayUrl(host: string, port: number): string {
   return `ws://${host}:${port}`;
+}
+
+/**
+ * Build an invite link for a room.
+ */
+export function buildInviteLink(host: string, port: number, code: string, password?: string): string {
+  const base = `codehive://${host}:${port}/join/${code}`;
+  if (password) {
+    return `${base}?password=${encodeURIComponent(password)}`;
+  }
+  return base;
 }

@@ -18,16 +18,25 @@ import {
 import type {
   AnyClientMessage,
   AnyServerMessage,
+  CursorPosition,
   DeviceId,
   DevName,
   DevStatus,
   FileChange,
   RelativePath,
   RoomCode,
+  SharedTerminal,
+  WebhookConfig,
 } from "../shared/types.js";
 import { now } from "../shared/utils.js";
 
 export type ServerEventHandler = (msg: AnyServerMessage) => void;
+export type MessagePredicate = (msg: AnyServerMessage) => boolean;
+
+interface PendingListener {
+  predicate: MessagePredicate;
+  callback: (msg: AnyServerMessage) => void;
+}
 
 export interface RelayClientOptions {
   host?: string;
@@ -59,8 +68,17 @@ export class RelayClient {
 
   private currentRoom: RoomCode | null = null;
   private currentStatus: DevStatus = "active";
+  private currentBranch: string | undefined;
+  private currentPassword: string | undefined;
 
-  private onMessage: ServerEventHandler;
+  /** Pending one-shot message listeners (for tool responses). */
+  private pendingListeners: PendingListener[] = [];
+
+  /** Queue of file changes captured while disconnected. */
+  private fileChangeQueue: FileChange[] = [];
+  private static readonly MAX_QUEUED_CHANGES = 50;
+
+  private onMessageHandler: ServerEventHandler;
   private onConnect: () => void;
   private onDisconnect: () => void;
 
@@ -70,24 +88,36 @@ export class RelayClient {
     this.deviceId = options.deviceId;
     this.devName = options.devName;
     this.projectPath = options.projectPath;
-    this.onMessage = options.onMessage ?? (() => {});
+    this.onMessageHandler = options.onMessage ?? (() => {});
     this.onConnect = options.onConnect ?? (() => {});
     this.onDisconnect = options.onDisconnect ?? (() => {});
   }
 
-  /** Whether the client is currently connected to the relay. */
   get connected(): boolean {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
-  /** The room this client is currently in, or null. */
   get roomCode(): RoomCode | null {
     return this.currentRoom;
   }
 
-  /**
-   * Connect to the relay server.
-   */
+  /** Set the current git branch for this client. */
+  setBranch(branch: string): void {
+    this.currentBranch = branch;
+  }
+
+  onceMessage(
+    predicate: MessagePredicate,
+    callback: (msg: AnyServerMessage) => void,
+  ): () => void {
+    const listener: PendingListener = { predicate, callback };
+    this.pendingListeners.push(listener);
+    return () => {
+      const idx = this.pendingListeners.indexOf(listener);
+      if (idx !== -1) this.pendingListeners.splice(idx, 1);
+    };
+  }
+
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.connected) {
@@ -102,6 +132,32 @@ export class RelayClient {
         this.reconnectAttempts = 0;
         this.startHeartbeat();
         this.onConnect();
+
+        if (this.currentRoom) {
+          const roomToRejoin = this.currentRoom;
+          this.onceMessage(
+            (msg) => msg.type === "room_joined" || msg.type === "error",
+            (msg) => {
+              if (msg.type === "room_joined") {
+                this.flushFileChangeQueue();
+              } else {
+                this.fileChangeQueue = [];
+                console.error(`[CodeHive Client] rejoin ${roomToRejoin} failed`);
+              }
+            },
+          );
+          this.send({
+            type: "join_room",
+            code: roomToRejoin,
+            deviceId: this.deviceId,
+            name: this.devName,
+            projectPath: this.projectPath,
+            password: this.currentPassword,
+            branch: this.currentBranch,
+            timestamp: now(),
+          });
+        }
+
         resolve();
       });
 
@@ -110,27 +166,30 @@ export class RelayClient {
         const msg = decodeServerMessage(data);
         if (msg) {
           this.handleServerMessage(msg);
-          this.onMessage(msg);
+          this.dispatchToPendingListeners(msg);
+          this.onMessageHandler(msg);
         }
       });
 
       this.ws.on("close", () => {
         this.stopHeartbeat();
-        this.onDisconnect();
-        this.scheduleReconnect();
+        if (this.shouldReconnect) {
+          this.onDisconnect();
+          this.scheduleReconnect();
+        }
       });
 
       this.ws.on("error", (err) => {
         if (this.reconnectAttempts === 0) {
+          this.shouldReconnect = false;
           reject(new Error(`Failed to connect to relay at ${url}: ${err.message}`));
+        } else {
+          console.error(`[CodeHive Client] reconnect attempt ${this.reconnectAttempts} failed: ${err.message}`);
         }
       });
     });
   }
 
-  /**
-   * Disconnect from the relay server.
-   */
   disconnect(): void {
     this.shouldReconnect = false;
 
@@ -156,38 +215,43 @@ export class RelayClient {
     }
 
     this.currentRoom = null;
+    this.pendingListeners = [];
+    this.fileChangeQueue = [];
   }
 
-  /**
-   * Create a new collaboration room.
-   */
-  createRoom(): void {
+  // -----------------------------------------------------------------------
+  // Room operations
+  // -----------------------------------------------------------------------
+
+  createRoom(password?: string, isPublic?: boolean, expiresInHours?: number): void {
+    this.currentPassword = password;
     this.send({
       type: "create_room",
       deviceId: this.deviceId,
       name: this.devName,
       projectPath: this.projectPath,
+      password,
+      isPublic,
+      expiresInHours,
+      branch: this.currentBranch,
       timestamp: now(),
     });
   }
 
-  /**
-   * Join an existing room by code.
-   */
-  joinRoom(code: RoomCode): void {
+  joinRoom(code: RoomCode, password?: string): void {
+    this.currentPassword = password;
     this.send({
       type: "join_room",
       code,
       deviceId: this.deviceId,
       name: this.devName,
       projectPath: this.projectPath,
+      password,
+      branch: this.currentBranch,
       timestamp: now(),
     });
   }
 
-  /**
-   * Leave the current room.
-   */
   leaveRoom(): void {
     if (!this.currentRoom) return;
 
@@ -199,13 +263,23 @@ export class RelayClient {
     });
 
     this.currentRoom = null;
+    this.currentPassword = undefined;
   }
 
-  /**
-   * Report a file change to teammates.
-   */
+  // -----------------------------------------------------------------------
+  // File operations
+  // -----------------------------------------------------------------------
+
   reportFileChange(change: FileChange): void {
-    if (!this.currentRoom) return;
+    if (!this.currentRoom || !this.connected) {
+      if (this.currentRoom) {
+        this.fileChangeQueue.push(change);
+        if (this.fileChangeQueue.length > RelayClient.MAX_QUEUED_CHANGES) {
+          this.fileChangeQueue.shift();
+        }
+      }
+      return;
+    }
 
     this.send({
       type: "file_change",
@@ -216,9 +290,6 @@ export class RelayClient {
     });
   }
 
-  /**
-   * Declare which files you are currently working on.
-   */
   declareWorkingOn(files: RelativePath[]): void {
     if (!this.currentRoom) return;
 
@@ -232,9 +303,10 @@ export class RelayClient {
     });
   }
 
-  /**
-   * Send a chat message to all room members.
-   */
+  // -----------------------------------------------------------------------
+  // Chat
+  // -----------------------------------------------------------------------
+
   sendChatMessage(content: string): void {
     if (!this.currentRoom) return;
 
@@ -248,9 +320,10 @@ export class RelayClient {
     });
   }
 
-  /**
-   * Request the current room status from the relay.
-   */
+  // -----------------------------------------------------------------------
+  // Status
+  // -----------------------------------------------------------------------
+
   requestStatus(): void {
     if (!this.currentRoom) return;
 
@@ -258,6 +331,147 @@ export class RelayClient {
       type: "request_status",
       code: this.currentRoom,
       deviceId: this.deviceId,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Typing indicators
+  // -----------------------------------------------------------------------
+
+  declareTyping(file: RelativePath | null): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "declare_typing",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      name: this.devName,
+      file,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: File locking
+  // -----------------------------------------------------------------------
+
+  lockFile(file: RelativePath): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "lock_file",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      name: this.devName,
+      file,
+      timestamp: now(),
+    });
+  }
+
+  unlockFile(file: RelativePath): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "unlock_file",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      name: this.devName,
+      file,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Cursor sharing
+  // -----------------------------------------------------------------------
+
+  updateCursor(cursor: CursorPosition | null): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "update_cursor",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      name: this.devName,
+      cursor,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Terminal sharing
+  // -----------------------------------------------------------------------
+
+  shareTerminal(terminal: SharedTerminal): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "share_terminal",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      name: this.devName,
+      terminal,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Room discovery
+  // -----------------------------------------------------------------------
+
+  listRooms(): void {
+    this.send({
+      type: "list_rooms",
+      deviceId: this.deviceId,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Timeline
+  // -----------------------------------------------------------------------
+
+  getTimeline(limit?: number): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "get_timeline",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      limit,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Webhook
+  // -----------------------------------------------------------------------
+
+  setWebhook(webhook: WebhookConfig | null): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "set_webhook",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      webhook,
+      timestamp: now(),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // NEW: Room visibility
+  // -----------------------------------------------------------------------
+
+  setRoomVisibility(isPublic: boolean): void {
+    if (!this.currentRoom) return;
+
+    this.send({
+      type: "set_room_visibility",
+      code: this.currentRoom,
+      deviceId: this.deviceId,
+      isPublic,
       timestamp: now(),
     });
   }
@@ -286,6 +500,35 @@ export class RelayClient {
     }
   }
 
+  private dispatchToPendingListeners(msg: AnyServerMessage): void {
+    const toRemove: number[] = [];
+    for (let i = 0; i < this.pendingListeners.length; i++) {
+      const listener = this.pendingListeners[i]!;
+      if (listener.predicate(msg)) {
+        listener.callback(msg);
+        toRemove.push(i);
+      }
+    }
+    for (let i = toRemove.length - 1; i >= 0; i--) {
+      this.pendingListeners.splice(toRemove[i]!, 1);
+    }
+  }
+
+  private flushFileChangeQueue(): void {
+    if (!this.currentRoom || this.fileChangeQueue.length === 0) return;
+
+    for (const change of this.fileChangeQueue) {
+      this.send({
+        type: "file_change",
+        code: this.currentRoom,
+        deviceId: this.deviceId,
+        change,
+        timestamp: now(),
+      });
+    }
+    this.fileChangeQueue = [];
+  }
+
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
@@ -295,6 +538,7 @@ export class RelayClient {
           code: this.currentRoom,
           deviceId: this.deviceId,
           status: this.currentStatus,
+          branch: this.currentBranch,
           timestamp: now(),
         });
       }
@@ -319,9 +563,8 @@ export class RelayClient {
     this.reconnectAttempts++;
 
     this.reconnectTimer = setTimeout(() => {
-      this.connect().catch(() => {
-        // Will retry via the close handler
-      });
+      if (!this.shouldReconnect) return;
+      this.connect().catch(() => {});
     }, delay);
   }
 }

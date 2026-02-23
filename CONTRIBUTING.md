@@ -44,13 +44,26 @@ src/
 │   └── server.ts    # WebSocket server, message routing
 ├── mcp/             # MCP server for Claude Code integration
 │   ├── client.ts    # WebSocket client (connects to relay)
-│   ├── tools.ts     # MCP tool definitions (8 tools)
+│   ├── tools.ts     # MCP tool definitions (14 tools + 2 resources)
 │   └── index.ts     # MCP server entry point
 ├── watcher/         # File system watcher
 │   └── index.ts     # chokidar-based file change detection
 ├── cli/             # Command-line interface
 │   └── index.ts     # All CLI commands (init, relay, deploy, etc.)
 └── index.ts         # Public API exports
+```
+
+## Running Tests
+
+```bash
+# Run all tests (builds, starts relay, runs E2E + edge cases)
+npm test
+
+# Or manually:
+npm run build
+CODEHIVE_PORT=4821 node dist/relay/server.js &
+node test-e2e.mjs
+node test-edge-cases.mjs
 ```
 
 ## Guidelines

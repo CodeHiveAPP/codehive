@@ -2,48 +2,85 @@
  * CodeHive MCP Server
  *
  * Entry point for the Model Context Protocol server that integrates
- * CodeHive collaboration into Claude Code. When Claude Code starts
- * this server, it gains access to all collaboration tools:
- *
- *   - create_room      → Create a new collaboration room
- *   - join_room        → Join an existing room
- *   - leave_room       → Leave the current room
- *   - get_team_status  → See connected teammates
- *   - get_recent_changes → View teammates' file changes
- *   - send_message     → Chat with teammates
- *   - declare_working  → Declare files you're editing
- *   - get_notifications → Check unread notifications
- *
- * Environment variables:
- *   CODEHIVE_RELAY_HOST  → Relay server host (default: 127.0.0.1)
- *   CODEHIVE_RELAY_PORT  → Relay server port (default: 4819)
- *   CODEHIVE_DEV_NAME    → Your display name (default: system username)
- *   CODEHIVE_PROJECT     → Project root path (default: cwd)
+ * CodeHive collaboration into any MCP-compatible AI editor.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
 import {
   DEFAULT_RELAY_HOST,
   DEFAULT_RELAY_PORT,
 } from "../shared/protocol.js";
 import type { AnyServerMessage } from "../shared/types.js";
-import { generateDeviceId, formatTime } from "../shared/utils.js";
+import { generateDeviceId } from "../shared/utils.js";
 import { RelayClient } from "./client.js";
 import { registerTools, type ToolState } from "./tools.js";
 import { FileWatcher } from "../watcher/index.js";
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** Detect current git branch in the project directory. */
+function detectGitBranch(projectPath: string): string | undefined {
+  try {
+    const branch = execSync("git rev-parse --abbrev-ref HEAD", {
+      cwd: projectPath,
+      encoding: "utf-8",
+      timeout: 3000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return branch || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Load codehive.json config from project root. */
+function loadProjectConfig(projectPath: string): Record<string, unknown> {
+  try {
+    const configPath = resolve(projectPath, "codehive.json");
+    const data = readFileSync(configPath, "utf-8");
+    return JSON.parse(data) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 async function main(): Promise<void> {
-  const relayHost = process.env["CODEHIVE_RELAY_HOST"] ?? DEFAULT_RELAY_HOST;
+  const projectPath = resolve(process.env["CODEHIVE_PROJECT"] ?? process.cwd());
+
+  // Load project config (codehive.json)
+  const config = loadProjectConfig(projectPath);
+
+  const relayHost = (process.env["CODEHIVE_RELAY_HOST"] ?? config["relayHost"] ?? DEFAULT_RELAY_HOST) as string;
   const relayPort = parseInt(
-    process.env["CODEHIVE_RELAY_PORT"] ?? String(DEFAULT_RELAY_PORT),
+    (process.env["CODEHIVE_RELAY_PORT"] ?? String(config["relayPort"] ?? DEFAULT_RELAY_PORT)) as string,
     10,
   );
-  const devName = process.env["CODEHIVE_DEV_NAME"] ?? userInfo().username;
-  const projectPath = resolve(process.env["CODEHIVE_PROJECT"] ?? process.cwd());
+  const devName = (process.env["CODEHIVE_DEV_NAME"] ?? config["devName"] ?? userInfo().username) as string;
   const deviceId = generateDeviceId();
+
+  // Detect git branch
+  const gitBranch = detectGitBranch(projectPath);
+
+  // -----------------------------------------------------------------------
+  // Build MCP server
+  // -----------------------------------------------------------------------
+  const _require = createRequire(import.meta.url);
+  const { version } = _require("../../package.json") as { version: string };
+
+  const server = new McpServer({
+    name: "codehive",
+    version,
+  });
 
   // -----------------------------------------------------------------------
   // Set up shared state
@@ -56,38 +93,83 @@ async function main(): Promise<void> {
   };
 
   // -----------------------------------------------------------------------
-  // Build notification handler
+  // Real-time push notifications to the editor
   // -----------------------------------------------------------------------
+
+  function pushToEditor(level: "info" | "warning" | "error", text: string): void {
+    server.sendLoggingMessage({
+      level,
+      logger: "codehive",
+      data: text,
+    }).catch(() => {});
+  }
+
   function handleServerEvent(msg: AnyServerMessage): void {
+    let notification: string | null = null;
+
     switch (msg.type) {
       case "member_joined":
-        state.pendingNotifications.push(
-          `${msg.member.name} joined the room`,
-        );
+        notification = `${msg.member.name} joined the room${msg.member.branch ? ` [${msg.member.branch}]` : ""}`;
+        pushToEditor("info", notification);
         break;
 
       case "member_left":
-        state.pendingNotifications.push(
-          `${msg.member.name} left the room`,
-        );
+        notification = `${msg.member.name} left the room`;
+        pushToEditor("info", notification);
         break;
 
-      case "file_changed":
-        state.pendingNotifications.push(
-          `${msg.change.author} ${msg.change.type}d ${msg.change.path} (+${msg.change.linesAdded} -${msg.change.linesRemoved})`,
-        );
+      case "file_changed": {
+        const c = msg.change;
+        if (c.sizeAfter !== undefined && c.sizeAfter !== null) {
+          const size = formatBytes(c.sizeAfter);
+          notification = `${c.author} ${c.type}d ${c.path} (${size})`;
+        } else {
+          notification = `${c.author} ${c.type}d ${c.path} (+${c.linesAdded} -${c.linesRemoved})`;
+        }
+        pushToEditor("info", notification);
         break;
+      }
 
       case "chat_received":
-        state.pendingNotifications.push(
-          `Message from ${msg.from}: ${msg.content}`,
-        );
+        notification = `[Chat] ${msg.from}: ${msg.content}`;
+        pushToEditor("info", notification);
         break;
 
       case "conflict_warning":
-        state.pendingNotifications.push(
-          `CONFLICT WARNING: ${msg.message}`,
-        );
+        notification = `CONFLICT WARNING: ${msg.message}`;
+        pushToEditor("warning", notification);
+        break;
+
+      case "typing_indicator":
+        if (msg.file) {
+          notification = `${msg.name} is typing in ${msg.file}`;
+          // Don't push typing to editor (too noisy), just add to notifications
+        }
+        break;
+
+      case "file_locked":
+        notification = `${msg.lock.lockedBy} locked ${msg.lock.file}`;
+        pushToEditor("info", notification);
+        break;
+
+      case "file_unlocked":
+        notification = `${msg.unlockedBy} unlocked ${msg.file}`;
+        pushToEditor("info", notification);
+        break;
+
+      case "lock_error":
+        notification = `Lock denied: ${msg.error}`;
+        pushToEditor("warning", notification);
+        break;
+
+      case "terminal_shared":
+        notification = `[Terminal] ${msg.terminal.sharedBy} shared: \`${msg.terminal.command}\` (exit ${msg.terminal.exitCode ?? "?"})`;
+        pushToEditor("info", notification);
+        break;
+
+      case "branch_warning":
+        notification = `BRANCH WARNING: ${msg.message}`;
+        pushToEditor("warning", notification);
         break;
 
       case "room_status":
@@ -95,7 +177,10 @@ async function main(): Promise<void> {
         break;
     }
 
-    // Keep notifications list bounded
+    if (notification) {
+      state.pendingNotifications.push(notification);
+    }
+
     if (state.pendingNotifications.length > 50) {
       state.pendingNotifications = state.pendingNotifications.slice(-50);
     }
@@ -119,6 +204,12 @@ async function main(): Promise<void> {
     },
   });
 
+  // Set git branch
+  if (gitBranch) {
+    client.setBranch(gitBranch);
+    console.error(`[CodeHive MCP] git branch: ${gitBranch}`);
+  }
+
   state.client = client;
 
   // -----------------------------------------------------------------------
@@ -134,25 +225,20 @@ async function main(): Promise<void> {
   });
 
   // -----------------------------------------------------------------------
-  // Connect to relay (non-blocking — tools will wait if needed)
+  // Periodic git branch re-detection (every 30s)
   // -----------------------------------------------------------------------
-  try {
-    await client.connect();
-  } catch {
-    // Relay might not be running yet; tools will report this to the user
-    console.error(
-      `[CodeHive MCP] relay not available at ${relayHost}:${relayPort}. Start it with: codehive relay`,
-    );
-  }
+  let lastKnownBranch = gitBranch;
+  const branchCheckInterval = setInterval(() => {
+    const newBranch = detectGitBranch(projectPath);
+    if (newBranch && newBranch !== lastKnownBranch) {
+      lastKnownBranch = newBranch;
+      client.setBranch(newBranch);
+    }
+  }, 30_000);
 
   // -----------------------------------------------------------------------
-  // Build and start MCP server
+  // Register tools and start MCP transport
   // -----------------------------------------------------------------------
-  const server = new McpServer({
-    name: "codehive",
-    version: "1.0.0",
-  });
-
   registerTools(server, state);
 
   const transport = new StdioServerTransport();
@@ -161,22 +247,33 @@ async function main(): Promise<void> {
   console.error("[CodeHive MCP] server started");
 
   // -----------------------------------------------------------------------
+  // Connect to relay
+  // -----------------------------------------------------------------------
+  try {
+    await client.connect();
+  } catch {
+    console.error(
+      `[CodeHive MCP] relay not available at ${relayHost}:${relayPort}. Start it with: codehive relay`,
+    );
+  }
+
+  // -----------------------------------------------------------------------
   // Graceful shutdown
   // -----------------------------------------------------------------------
-  process.on("SIGINT", () => shutdown(client, state));
-  process.on("SIGTERM", () => shutdown(client, state));
+  process.on("SIGINT", () => void shutdown(client, state, branchCheckInterval));
+  process.on("SIGTERM", () => void shutdown(client, state, branchCheckInterval));
+  process.stdin.on("end", () => void shutdown(client, state, branchCheckInterval));
+  process.stdin.resume();
 }
 
-function shutdown(client: RelayClient, state: ToolState): void {
+async function shutdown(client: RelayClient, state: ToolState, branchInterval: ReturnType<typeof setInterval>): Promise<void> {
   console.error("[CodeHive MCP] shutting down...");
-  state.watcher?.stop();
+  clearInterval(branchInterval);
+  if (state.watcher) {
+    await state.watcher.stop();
+  }
   client.disconnect();
   process.exit(0);
 }
 
 export default main;
-
-main().catch((err) => {
-  console.error("[CodeHive MCP] fatal error:", err);
-  process.exit(1);
-});
